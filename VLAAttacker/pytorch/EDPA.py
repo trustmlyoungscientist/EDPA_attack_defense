@@ -215,9 +215,9 @@ class EDPA:
 
         with tqdm.tqdm(total=self.max_steps, leave=False) as progress:
             for idx, batch in enumerate(dataloader):
-
-                input_key = "wrist_image" if self.cfg.camera_view == "wrist" else "image"
+                input_key = "wrist_image" if self.cfg.camera_view == "wrist" else "images"
                 images = self.convert_to_tensor(batch[input_key])
+                
                 instructions, instructions_masks = batch["input_ids"], batch["attention_mask"]
 
                 images_embed = get_img_embedding(vla, self.preprocess_tensor_images(images, processor.image_processor))
