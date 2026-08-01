@@ -1,17 +1,13 @@
 import torch
 from torchvision import transforms
 from torchvision.utils import save_image
-
 import numpy as np
 import torch.nn.functional as F
 
+from transformers import AutoProcessor
+from transformers import AutoConfig, AutoImageProcessor
+
 import tqdm
-
-
-## If using OFT, uncomment the following line and comment the next line
-from utils.openvla import image_transform, get_img_embedding, get_lang_embedding
-# from utils.openvla_oft import image_transform, get_img_embedding, get_lang_embedding
-
 
 class EDPA:
     def __init__(self, cfg, device_id = None):
@@ -26,45 +22,77 @@ class EDPA:
         self.image_size = cfg.image_size
         self.perturbation_ratio = cfg.perturbation_ratio
 
+        processor = None
+
+        if cfg.model_family == "openvla":
+
+            from utils.openvla import image_transform, get_img_embedding, get_lang_embedding
+            from openvla.prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+            from openvla.prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+            AutoConfig.register("openvla", OpenVLAConfig)
+            AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+            AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+
+            processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+
+        elif cfg.model_family == "openvla-oft":
+
+            from utils.openvla_oft import image_transform, get_img_embedding, get_lang_embedding
+            from openvla_oft.prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+            from openvla_oft.prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+            processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+
+        elif cfg.model_family == "pi0" or cfg.model_family == "pi05":
+            from utils.pi0 import image_transform, get_img_embedding, get_lang_embedding
+        else:
+            raise NotImplementedError(f"Model family {cfg.model_family} not supported yet.")
+        
+        self.processor = processor
+        self.image_transform, self.get_img_embedding, self.get_lang_embedding = (
+            image_transform, get_img_embedding, get_lang_embedding
+        )
+
         self.ema_step = 0
         self.ema_warmup = 100
-
         self.ema_patch, self.ema_align = 0, 0
         self.ema_decay = 0.9
 
+        self.use_film = cfg.use_film if hasattr(cfg, "use_film") else False
+
         self.cfg = cfg
-        self.device_id = device_id if device_id is not None else torch.device("cpu")
+        self.device_id = device_id if device_id is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def convert_to_tensor(self, images):
-        return torch.stack([transforms.ToTensor()(image) for image in images])
+
+    def reset_ema(self):
+        self.ema_step = 0
+        self.ema_patch, self.ema_align = 0, 0
     
-    def preprocess_tensor_images(self, images, processor=None):
-        return torch.stack([
-            image_transform(img, processor) for img in images
-        ])
-    
+
     def apply_random_perturbation_to_tensor(self, images, perturbation):
-
         B, C, H, W = images.shape
-        pc, ph, pw = perturbation.shape
 
-        assert pc == C, "Perturbation must have the same number of channels as the input images."
+        # universal patch: (C, ph, pw) -> (B, C, ph, pw)
+        if perturbation.dim() == 3:
+            perturbation = perturbation.unsqueeze(0).expand(B, -1, -1, -1)
 
-        # perturbated_images = image_tensors.clone()
+        _, _, ph, pw = perturbation.shape
+
         perturbated_images = torch.zeros_like(images)
 
-        for i in range(len(perturbated_images)):
-            top = torch.randint(0, H - ph + 1, (1,)).item()
-            left = torch.randint(0, W - pw + 1, (1,)).item()
+        for i in range(B):
+            top = torch.randint(0, H - ph + 1, (1,), device=images.device).item()
+            left = torch.randint(0, W - pw + 1, (1,), device=images.device).item()
+
+            padded = torch.zeros_like(images[i])
+            padded[:, top:top + ph, left:left + pw] = perturbation[i]
 
             mask = torch.zeros_like(images[i])
             mask[:, top:top + ph, left:left + pw] = 1.0
 
-            padded_perturb = torch.zeros_like(images[i])
-            padded_perturb[:, top:top + ph, left:left + pw] = perturbation
+            perturbated_images[i] = (1 - mask) * images[i] + padded
 
-            perturbated_images[i] = (1 - mask) * images[i] + padded_perturb
-        
         return perturbated_images
     
 
@@ -84,16 +112,13 @@ class EDPA:
     
     def compute_loss(self, adv, clean, text, text_mask, reduction='none'):
 
-        # patch_loss = (1 - F.cosine_similarity(adv, clean, dim=-1)).mean(dim=-1)  
-        # patch_loss = F.mse_loss(adv, clean, reduction='none').mean(dim=(1, 2))
-
         logits = torch.bmm(F.normalize(adv, dim=-1),
                         F.normalize(clean, dim=-1).transpose(1, 2)) / 0.07
 
         labels = torch.arange(logits.size(1), device=logits.device).unsqueeze(0).expand(logits.size(0), -1)
 
         patch_loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),  
+            logits.reshape(-1, logits.size(-1)),  # 改成 reshape
             labels.reshape(-1),
             reduction='none'
         ).reshape(logits.size(0), logits.size(1)).mean(dim=1)
@@ -118,7 +143,7 @@ class EDPA:
         scaled_patch_loss = patch_loss / (ema_patch + 1e-8)
         scaled_align_loss = align_loss / (ema_align + 1e-8)    
 
-        batch_loss = self.alpha * scaled_patch_loss + (1-self.alpha) * scaled_align_loss
+        batch_loss = (1 - self.alpha) * scaled_patch_loss + self.alpha * scaled_align_loss
 
         if reduction == 'mean':
             return torch.mean(batch_loss), ema_patch, ema_align, patch_loss, align_loss
@@ -164,25 +189,35 @@ class EDPA:
         images,
         instructions,
         instructions_masks,
-        processor,
         perturbation,
-        images_embed=None,
-        lang_embed=None,
         eval=True
     ):
-        
-        if images_embed is None:
-            images = self.convert_to_tensor(images)
-            images_embed = get_img_embedding(vla, self.preprocess_tensor_images(images, processor.image_processor))
-        if lang_embed is None:
-            lang_embed = get_lang_embedding(vla, instructions)
+        instructions, instructions_masks = (
+            instructions.to(self.device_id),
+            instructions_masks.to(self.device_id)
+        )
+
+        images = images.to(self.device_id)
+
+        with torch.no_grad():
+            lang_embed = self.get_lang_embedding(vla, instructions)
+
+            if self.use_film:
+                images_embed = self.get_img_embedding(vla, self.image_transform(images, self.processor), lang_embed, use_film=True)
+            else:
+                images_embed = self.get_img_embedding(vla, self.image_transform(images, self.processor))
+            
 
         for _ in range(self.iterations):
 
             perturbation = perturbation.detach().requires_grad_()
 
             adv_images = self.apply_random_perturbation_to_tensor(images, perturbation)
-            adv_embed = get_img_embedding(vla, self.preprocess_tensor_images(adv_images, processor.image_processor))
+
+            if self.use_film:
+                adv_embed = self.get_img_embedding(vla, self.image_transform(adv_images, self.processor), lang_embed, use_film=True)
+            else:
+                adv_embed = self.get_img_embedding(vla, self.image_transform(adv_images, self.processor))
 
             cost, ema_patch, ema_align, patch_loss, align_loss = self.compute_loss(
                 adv_embed, images_embed, lang_embed, instructions_masks, reduction="mean"
@@ -215,12 +250,12 @@ class EDPA:
 
         with tqdm.tqdm(total=self.max_steps, leave=False) as progress:
             for idx, batch in enumerate(dataloader):
-                
+
                 images = self.convert_to_tensor(batch["images"])
                 instructions, instructions_masks = batch["input_ids"], batch["attention_mask"]
 
-                images_embed = get_img_embedding(vla, self.preprocess_tensor_images(images, processor.image_processor))
-                lang_embed = get_lang_embedding(vla, instructions)
+                images_embed = self.get_img_embedding(vla, self.image_transform(images, processor.image_processor))
+                lang_embed = self.get_lang_embedding(vla, instructions)
 
                 perturbation, cost, patch_loss, align_loss = self.generate_one_step(
                     vla, images, instructions, instructions_masks,
@@ -236,7 +271,7 @@ class EDPA:
                             output = vla(
                                 input_ids=instructions.to(self.device_id),
                                 attention_mask=instructions_masks.to(self.device_id),
-                                pixel_values=self.preprocess_tensor_images(adv_images, processor.image_processor)
+                                pixel_values=self.image_transform(adv_images, processor.image_processor)
                                     .to(torch.bfloat16).to(self.device_id),
                                 labels=batch["labels"]
                             )

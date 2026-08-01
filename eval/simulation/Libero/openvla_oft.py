@@ -27,13 +27,13 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
-from libero.libero import benchmark
+from LIBERO.libero.libero import benchmark
 
 import wandb
 import torch
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("./openvla_oft")
+# # Append current directory so that interpreter can find experiments.robot
+# sys.path.append("./openvla_oft")
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -58,7 +58,7 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
-from openvla_oft.prismatic.vla.constants import NUM_ACTIONS_CHUNK
+from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
 
 # Define task suite constants
@@ -284,8 +284,28 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
         log_message("Using default initial states", log_file)
         return initial_states, None
 
+def prepare_observation_without_attacks(obs, resize_size):
+    """Prepare observation for policy input without attacks."""
+    # Get preprocessed images
+    img = get_libero_image(obs)
+    wrist_img = get_libero_wrist_image(obs)
 
-def prepare_observation(obs, resize_size, perturbation_primary, perturbation_wrist, top, left, top_wrist, left_wrist):
+    # Resize images to size expected by model
+    img_resized = resize_image_for_policy(img, resize_size)
+    wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+
+    # Prepare observations dict
+    observation = {
+        "full_image": img_resized,
+        "wrist_image": wrist_img_resized,
+        "state": np.concatenate(
+            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+        ),
+    }
+
+    return observation, wrist_img_resized  # Return both processed observation and original image for replay
+
+def prepare_observation_with_attacks(obs, resize_size, perturbation_primary, perturbation_wrist, top, left, top_wrist, left_wrist):
     """Prepare observation for policy input."""
     # Get preprocessed images
     img = get_libero_image(obs)
@@ -294,6 +314,7 @@ def prepare_observation(obs, resize_size, perturbation_primary, perturbation_wri
     wrist_img = wrist_img.copy()
 
     # add perturbation to the primary
+
     perturbed_wrist_img = apply_perturbation_to_raw_images([wrist_img], perturbation_wrist, (top_wrist, left_wrist))[0]
     perturbed__primary_img = apply_perturbation_to_raw_images([img], perturbation_primary, (top, left))[0]
 
@@ -367,11 +388,14 @@ def run_episode(
     # Run episode
     success = False
     rng = np.random.default_rng(cfg.seed + total_episodes)
-    # random patch position
-    top = rng.integers(0, resize_size - perturbation_primary.shape[1] + 1)
-    left = rng.integers(0, resize_size - perturbation_primary.shape[2] + 1)
-    top_wrist = rng.integers(0, resize_size - perturbation_wrist.shape[1] + 1)
-    left_wrist = rng.integers(0, resize_size - perturbation_wrist.shape[2] + 1)
+
+    if cfg.patch_attack:
+        # random patch position
+        top = rng.integers(0, resize_size - perturbation_primary.shape[1] + 1)
+        left = rng.integers(0, resize_size - perturbation_primary.shape[2] + 1)
+        top_wrist = rng.integers(0, resize_size - perturbation_wrist.shape[1] + 1)
+        left_wrist = rng.integers(0, resize_size - perturbation_wrist.shape[2] + 1)
+
     try:
         while t < max_steps + cfg.num_steps_wait:
             # Do nothing for the first few timesteps to let objects stabilize
@@ -380,9 +404,12 @@ def run_episode(
                 t += 1
                 continue
 
-            # Prepare observation
-            observation, img = prepare_observation(obs, resize_size, perturbation_primary, perturbation_wrist, top,
-                                                   left, top_wrist, left_wrist)
+            if cfg.patch_attack :
+                observation, img = prepare_observation_with_attacks(obs, resize_size, perturbation_primary, perturbation_wrist, top,
+                                                    left, top_wrist, left_wrist)
+            else:
+                observation, img = prepare_observation_without_attacks(obs, resize_size)
+
             replay_images.append(img)
 
             # If action queue is empty, requery model
@@ -497,9 +524,9 @@ def run_task(
             total_successes += 1
 
         # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
-        )
+        # save_rollout_video(
+        #     replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+        # )
 
         # Log results
         log_message(f"Success: {success}", log_file)
@@ -557,6 +584,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
                 perturbation_wrist = torch.as_tensor(torch.load(cfg.perturbation_wrist_path))
             else:
                 raise ValueError("Unsupported wrist perturbation file type! Use .npy or .pt")
+            
+            print(f"Loaded primary perturbation from {cfg.perturbation_primary_path}")
+            print(f"Loaded wrist perturbation from {cfg.perturbation_wrist_path}")
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -580,8 +610,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             task_id,
             model,
             resize_size,
-            perturbation_primary,
-            perturbation_wrist,
+            perturbation_primary if cfg.patch_attack else None,
+            perturbation_wrist if cfg.patch_attack else None,
             processor,
             action_head,
             proprio_projector,

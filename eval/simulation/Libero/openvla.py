@@ -14,13 +14,19 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
-from LIBERO.libero.libero import benchmark
 import wandb
 
-from VLAAttacker.pytorch.EDPA import UPL
 
 # # Append current directory so that interpreter can find experiments.robot
-sys.path.append("./openvla")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+LIBERO_ROOT = os.path.join(PROJECT_ROOT, "LIBERO")
+OPENVLA_ROOT = os.path.join(PROJECT_ROOT, "openvla")
+
+
+for p in [OPENVLA_ROOT, PROJECT_ROOT, LIBERO_ROOT]:
+    if p in sys.path:
+        sys.path.remove(p)
+    sys.path.insert(0, p)
 
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -40,6 +46,8 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 
+from LIBERO.libero.libero import benchmark
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @dataclass
@@ -50,8 +58,8 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
-    pretrained_checkpoint: Union[str, Path] = "openvla/openvla-7b-finetuned-libero-spatial"     # Pretrained checkpoint path
-    # pretrained_checkpoint: Optional[Union[str, Path]] = "/media/haochuanxu/Working/githubRepo/model/openvla-7b-libero_spatial-wrist"  #
+    # pretrained_checkpoint: Union[str, Path] = "openvla/openvla-7b-finetuned-libero-object"     # Pretrained checkpoint path
+    pretrained_checkpoint: Optional[Union[str, Path]] = "checkpoints/v2.3.4+openvla-7b-finetuned-libero-goal+libero_goal_no_noops+view-primary+adv-encoder-finetune+b16+lr-0.0005/4700_chkpt"  #
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
@@ -60,9 +68,9 @@ class GenerateConfig:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    task_suite_name: str = "libero_goal"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 5                    # Number of rollouts per task
+    num_trials_per_task: int = 50                    # Number of rollouts per task
 
     #################################################################################################################
     # Utils
@@ -76,8 +84,8 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
-    patch_attack: bool = True                       # Whether to use patch-based adversarial attack
-    perturbation_path: str = ""                      # Path to perturbation file
+    patch_attack: bool = True                        # Whether to use patch-based adversarial attack
+    perturbation_path: str = "perturbation/openvla-uoa-0.05/perturbation.pt"   # Path to perturbation file
 
 
 
@@ -162,7 +170,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks_in_suite = 3
+    num_tasks_in_suite = task_suite.n_tasks
     print(f"Task suite: {cfg.task_suite_name}")
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
@@ -173,6 +181,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
         if cfg.perturbation_path == "":
             raise ValueError("If using patch-based attack, please provide a valid perturbation path!")
         else:
+            print(f"Loading perturbation from {cfg.perturbation_path}...")
             if cfg.perturbation_path.endswith(".npy"):
                 perturbation = np.load(cfg.perturbation_path)
                 perturbation = torch.from_numpy(perturbation)
@@ -227,8 +236,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
 
-            top = np.random.randint(0, resize_size - perturbation.shape[1] + 1)
-            left = np.random.randint(0, resize_size - perturbation.shape[2] + 1)
+            if cfg.patch_attack:
+                top = np.random.randint(0, resize_size - perturbation.shape[1] + 1)
+                left = np.random.randint(0, resize_size - perturbation.shape[2] + 1)
 
             while t < max_steps + cfg.num_steps_wait:
                 try:
@@ -293,9 +303,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
-            save_rollout_video(
-                replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
-            )
+            # save_rollout_video(
+            #     replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
+            # )
             # Log current results
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
@@ -304,22 +314,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"# episodes completed so far: {total_episodes}\n")
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
-
-            if True:
-                from PIL import Image
-                save_dir = "saved_images"
-                os.makedirs(save_dir, exist_ok=True)
-
-                n = len(replay_images)
-                indices = [0] + [round(i * (n-1)/5) for i in range(1, 5)] + [n-1]
-                indices = sorted(set(indices))
-
-                for idx, i in enumerate(indices):
-                    img = Image.fromarray(replay_images[i])  # 转成 PIL.Image
-                    img.save(os.path.join(save_dir, f"image_{idx+1}.png"))
-
-                print(f"Saved {len(indices)} images to {save_dir}")
-            exit(0)
 
         # Log final results
         print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")

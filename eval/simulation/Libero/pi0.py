@@ -12,7 +12,7 @@ import pathlib
 import torch
 
 from LIBERO.libero.libero import benchmark
-from LIBERO.libero import get_libero_path
+from LIBERO.libero.libero import get_libero_path
 from LIBERO.libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 
@@ -22,21 +22,14 @@ from openpi_client import image_tools
 from openpi.policies import policy_config
 from torchvision import transforms
 
-from experiments.robot.robot_utils import (
-    DATE_TIME,
-)
-
-from experiments.robot.libero.libero_utils import (
-    save_rollout_video,
-)
-
-from VLAAttacker.UUPP import UUPP
 
 import tqdm
 import draccus
 
+import time
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 
 
 @dataclasses.dataclass
@@ -46,6 +39,8 @@ class Args:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "pi0"                    # Model family
+    pretrained_checkpoint: str = ""  # Local pi0 PyTorch checkpoint
+    openpi_config: str = "pi0_libero"            # openpi train config name matching the checkpoint
     resize_size: int = 224
     replan_steps: int = 5
 
@@ -68,6 +63,9 @@ class Args:
     patch_attack: bool = True                        # Whether to use patch-based adversarial attack
     perturbation_primary_path: str = ""              # Path to perturbation file on primary camera
     perturbation_wrist_path: str = ""                # Path to perturbation file on wrist camera
+    use_wandb: bool = False                           # Whether to log success rates to Weights & Biases
+    wandb_project: str = "pi0-edpa-ablation"          # Name of W&B project to log to
+    wandb_entity: str = ""                      # Name of W&B entity to log under
 
 def apply_perturbation_to_raw_images(images, perturbation, position=(-1, -1)):
 
@@ -107,20 +105,24 @@ def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
 
     # Initialize local logging
-    run_id = f"EVAL-{Args.task_suite_name}-{Args.model_family}-{DATE_TIME}"
-    if Args.run_id_note is not None:
-        run_id += f"--{Args.run_id_note}"
-    os.makedirs(Args.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(Args.local_log_dir, run_id + ".txt")
+    run_id = f"EVAL-{args.task_suite_name}-{args.model_family}-{DATE_TIME}"
+    if args.run_id_note is not None:
+        run_id += f"--{args.run_id_note}"
+    os.makedirs(args.local_log_dir, exist_ok=True)
+    local_log_filepath = os.path.join(args.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
+
+    if args.use_wandb:
+        import wandb
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=f"EVAL-{run_id}")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
-    print(f"Task suite: {Args.task_suite_name}")
-    log_file.write(f"Task suite: {Args.task_suite_name}\n")
+    print(f"Task suite: {args.task_suite_name}")
+    log_file.write(f"Task suite: {args.task_suite_name}\n")
 
 
     if args.task_suite_name == "libero_spatial":
@@ -136,8 +138,8 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
-    checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_fast_libero")
-    client = policy_config.create_trained_policy(config.get_config("pi0_fast_libero"), checkpoint_dir)
+    checkpoint_dir = args.pretrained_checkpoint
+    client = policy_config.create_trained_policy(config.get_config(args.openpi_config), checkpoint_dir)
 
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
@@ -192,11 +194,12 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
  
-            top_primary = np.random.randint(0, args.resize_size - perturbation_primary.shape[1] + 1)
-            left_primary = np.random.randint(0, args.resize_size - perturbation_primary.shape[2] + 1)
+            if args.patch_attack:
+                top_primary = np.random.randint(0, args.resize_size - perturbation_primary.shape[1] + 1)
+                left_primary = np.random.randint(0, args.resize_size - perturbation_primary.shape[2] + 1)
 
-            top_wrist = np.random.randint(0, args.resize_size - perturbation_wrist.shape[1] + 1)
-            left_wrist = np.random.randint(0, args.resize_size - perturbation_wrist.shape[2] + 1)
+                top_wrist = np.random.randint(0, args.resize_size - perturbation_wrist.shape[1] + 1)
+                left_wrist = np.random.randint(0, args.resize_size - perturbation_wrist.shape[2] + 1)
 
 
             logging.info(f"Starting episode {task_episodes+1}...")
@@ -229,8 +232,6 @@ def eval_libero(args: Args) -> None:
                     
                     # Save preprocessed image for replay video
                     replay_images.append(wrist_img)
-
-                    img = np.zeros_like(img)
 
 
                     if not action_plan:
@@ -274,10 +275,7 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
-            save_rollout_video(
-                replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
-            )
+            # (replay video saving disabled)
             # Log current results
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
@@ -289,14 +287,29 @@ def eval_libero(args: Args) -> None:
 
 
         # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
-        log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
+        task_success_rate = float(task_successes) / float(task_episodes)
+        total_success_rate = float(total_successes) / float(total_episodes)
+        print(f"Current task success rate: {task_success_rate}")
+        print(f"Current total success rate: {total_success_rate}")
+        log_file.write(f"Current task success rate: {task_success_rate}\n")
+        log_file.write(f"Current total success rate: {total_success_rate}\n")
         log_file.flush()
 
-    # logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
-    # logging.info(f"Total episodes: {total_episodes}")
+        if args.use_wandb:
+            wandb.log({
+                f"success_rate/{task_description}": task_success_rate,
+                "success_rate/total": total_success_rate,
+                "num_episodes/total": total_episodes,
+            }, step=task_id)
+
+    final_success_rate = float(total_successes) / float(total_episodes)
+    print(f"Total success rate: {final_success_rate}")
+    log_file.write(f"Total success rate: {final_success_rate}\n")
+    log_file.flush()
+
+    if args.use_wandb:
+        wandb.log({"success_rate/final": final_success_rate})
+        wandb.finish()
 
 
 def _get_libero_env(task, resolution, seed):

@@ -1,5 +1,9 @@
 import os
 import torch
+import torchvision.transforms as transforms
+import numpy as np
+import tqdm
+from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 from accelerate import PartialState
 import time
@@ -13,10 +17,9 @@ from transformers import AutoConfig, AutoImageProcessor
 from openvla.prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from openvla.prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from openvla.prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from openvla.prismatic.vla.action_tokenizer import ActionTokenizer
-from openvla.prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 
-from utils.data_utils_openvla import RLDSBatchTransform, RLDSDataset, PaddedCollatorForActionPrediction
+from utils.data_utils import RLDSDataLoader
+from utils.openvla import build_prompt
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -25,34 +28,33 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class FinetuneConfig:
     # fmt: off
     model_family: str = "openvla"                                     # Path to OpenVLA model (on HuggingFace Hub)
-    vla_path: str = "openvla/openvla-7b-finetuned-libero-spatial"     # Path to OpenVLA model (on HuggingFace Hub)
+    vla_path: str = "openvla/openvla-7b-finetuned-libero-spatial"      # Path to OpenVLA model (on HuggingFace Hub)
     # Directory Paths
     data_root_dir: Path = Path("dataset/modified_libero_rlds")        # Path to Open-X dataset directory
     dataset_name: str = "libero_spatial_no_noops"                     # Name of fine-tuning dataset (e.g., `droid_wipe`)
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+    run_root_dir: Path = Path("runs")                                 # Path to directory to store logs & checkpoints
+    adapter_tmp_dir: Path = Path("adapter-tmp")                       # Temporary directory for LoRA weights before fusing
     local_log_dir: str = "./logs"
 
     # Attack Configuration
     image_size: int = 224                                           # Image size (e.g., 224 for 224x224 images)
-    perturbation_ratio: float = 0.04                                # Ratio of perturbation to apply (e.g., 0.1 for 10% perturbation)
-    alpha: float = 0.8                                              # Alpha value for perturbation blending
-    max_steps: int = 50000                                          # Maximum number of perturbation steps
+    perturbation_ratio: float = 0.05                                 # Ratio of perturbation to apply (e.g., 0.1 for 10% perturbation)
+    alpha: float = 0.2                                              # Alpha value for perturbation blending
+    max_steps: int = 1200                                           # Maximum number of perturbation steps
     iterations: int = 1                                             # Number of perturbation iterations per step
     step_size: float = 2 / 255                                      # Step size for perturbation updates
-    save_path: str = ""                                             # Path to save perturbations
+    save_path: str = "perturbation/openvla-uoa"                     # Path to save perturbations
     verbose: bool = True                                            # Whether to print verbose output during training
 
     # Fine-tuning Parameters
     batch_size: int = 2                                             # Fine-tuning batch size
     save_steps: int = 10                                            # Interval for checkpoint saving
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
-    image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 2000                                 # Dataloader shuffle buffer size (can reduce if OOM)
 
     # Tracking Parameters
     experiment: bool = False                                        # Whether to run the experiment
-    use_wandb: bool = False                                         # Whether to use Weights & Biases for tracking
+    use_wandb: bool = True                                          # Whether to use Weights & Biases for tracking
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = ""                                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
@@ -84,44 +86,66 @@ def train_up(cfg: FinetuneConfig) -> None:
         trust_remote_code=True
     ).to(device_id)
 
-    action_tokenizer = ActionTokenizer(processor.tokenizer)
-
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-        view=cfg.camera_view,
-    )
-
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        train=True,  
-    )
-
-    collator = PaddedCollatorForActionPrediction(
-        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-    )
-
-    dataloader = DataLoader(
-        vla_dataset,
-        batch_size=cfg.batch_size,
-        sampler=None,
-        collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
-    )
+    dataloader = RLDSDataLoader(cfg=cfg)
 
     os.makedirs(f"{cfg.save_path}-{cfg.perturbation_ratio}", exist_ok=True)
 
     from VLAAttacker.pytorch.EDPA import EDPA
     attacker = EDPA(cfg, device_id=device_id)
     
-    # Generate perturbation
-    attacker.generate(vla, dataloader, processor, action_tokenizer)
+    patch_size = int(np.sqrt(cfg.image_size ** 2 * cfg.perturbation_ratio))
+    perturbation = torch.zeros((3, patch_size, patch_size), dtype=torch.float32).uniform_(0, 1)
+
+    if cfg.use_wandb:
+        import wandb
+        exp_id = (
+            f"{cfg.vla_path.split('/')[-1]}+{cfg.dataset_name}"
+            f"+ratio-{cfg.perturbation_ratio}"
+            f"+iter-{cfg.iterations}"        
+        )
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+
+    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+        for idx, batch in enumerate(dataloader):
+
+            if cfg.camera_view == "random":
+                p, w = batch["image"], batch["wrist_image"]
+                m = torch.rand(p.shape[0], device=p.device) < 0.5
+                while m.dim() < p.dim():
+                    m = m.unsqueeze(-1)
+                images = torch.where(m, w, p)
+            elif cfg.camera_view == "primary":
+                images = batch["image"]
+            else:
+                images = batch["wrist_image"]
+
+            images = torch.stack([transforms.ToTensor()(image) for image in images])
+            prompt = build_prompt(batch["language_instruction"])
+
+            instructions, instructions_masks = ( 
+                 processor.tokenizer(prompt, padding=True, return_tensors="pt")[k] for k in ("input_ids", "attention_mask") 
+            )
+
+            perturbation, cost, patch_loss, align_loss = attacker.generate_one_step(
+                vla, images, instructions, instructions_masks, perturbation,
+            )
+
+            if cfg.use_wandb:
+                wandb.log({
+                    "cost": cost.item(),
+                    "patch_loss": patch_loss.mean(),
+                    "align_loss": align_loss.mean(),
+                }, step=idx)
+
+            if idx % cfg.save_steps == 0:
+                torch.save(perturbation, f"{cfg.save_path}-{cfg.perturbation_ratio}/perturbation.pt")
+                save_image(perturbation, f"{cfg.save_path}-{cfg.perturbation_ratio}/perturbation.png")
+
+            if idx >= cfg.max_steps:
+                break
+
+            progress.update()
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     train_up()

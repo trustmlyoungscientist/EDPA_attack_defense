@@ -1,13 +1,14 @@
+from PIL import Image
 from pathlib import Path
 from typing import Any, Dict
 from torch.utils.data import IterableDataset, DataLoader
 
-from openvla.prismatic.vla.datasets.rlds import make_interleaved_dataset
-from openvla.prismatic.vla.datasets.rlds.oxe import (
+from utils.datasets.rlds import make_interleaved_dataset
+from utils.datasets.rlds.oxe import (
     OXE_NAMED_MIXTURES,
     get_oxe_dataset_kwargs_and_weights,
 )
-from openvla.prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+from utils.datasets.rlds.utils.data_utils import NormalizationType
 
 import numpy as np
 
@@ -16,10 +17,10 @@ class RLDSBatchTransform:
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "dataset_name": rlds_batch["dataset_name"],
-            "image": np.asarray(rlds_batch["observation"]["image_primary"]),        
-            "wrist_image": np.asarray(rlds_batch["observation"]["image_wrist"]),             
+            "image": Image.fromarray(rlds_batch["observation"]["image_primary"][0]),        
+            "wrist_image": Image.fromarray(rlds_batch["observation"]["image_wrist"][0]),             
             "action": rlds_batch["action"],                                       
-            "language_instruction": rlds_batch["task"]["language_instruction"].decode().lower()      
+            "language_instruction": rlds_batch["task"]["language_instruction"].decode()     
         }
 
 
@@ -34,13 +35,16 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
     ) -> None:
         self.data_root_dir = data_root_dir
-        self.data_mix = data_mix
+        self.data_mix = list(data_mix) if type(data_mix) is tuple else data_mix.split(",")
         self.batch_transform = batch_transform
+        
+        mixture_spec = []
 
-        if self.data_mix in OXE_NAMED_MIXTURES:
-            mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
-        else:
-            mixture_spec = [(self.data_mix, 1.0)]
+        for dataset_name in self.data_mix:
+            if dataset_name in OXE_NAMED_MIXTURES:
+                mixture_spec.extend(OXE_NAMED_MIXTURES[dataset_name])
+            else:
+                mixture_spec.extend((dataset_name, 1.0))
 
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
@@ -75,7 +79,7 @@ class RLDSDataset(IterableDataset):
         return make_interleaved_dataset(**rlds_config)
 
     def __iter__(self) -> Dict[str, Any]:
-        for rlds_batch in self.dataset.take(self.dataset_length).as_numpy_iterator():
+        for rlds_batch in self.dataset.as_numpy_iterator():
             yield self.batch_transform(rlds_batch)
 
     def __len__(self) -> int:
@@ -88,9 +92,9 @@ class RLDSDataset(IterableDataset):
 # === Identity Collator ===
 def identity_collate_fn(batch):
     return dict(
-        image=np.squeeze(np.stack([b["image"] for b in batch], axis=0)),
-        wrist_image=np.squeeze(np.stack([b["wrist_image"] for b in batch], axis=0)),
-        action=np.squeeze(np.stack([b["action"] for b in batch], axis=0)).shape,
+        image=[b["image"] for b in batch],           # 保持 PIL Image list
+        wrist_image=[b["wrist_image"] for b in batch],
+        action=np.stack([b["action"] for b in batch], axis=0),
         language_instruction=[b["language_instruction"] for b in batch],
     )
 

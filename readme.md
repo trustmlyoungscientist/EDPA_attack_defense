@@ -27,6 +27,13 @@ Install OpenVLA by following the installation instructions in its repository:
 Install Pi0 by following the installation instructions in its repository:  
 [Pi0 Repository](https://github.com/Physical-Intelligence/openpi)
 
+> ⚠️ **Pi0 must use the PyTorch checkpoint**, not the default JAX one shipped by
+> upstream `openpi`. Convert an existing JAX training checkpoint to PyTorch first,
+> e.g. via `openpi/examples/convert_jax_model_to_pytorch.py`, then pass the
+> resulting directory (containing `model.safetensors` + `config.json` +
+> `assets/local/<repo>/norm_stats.json`) as `--vla_path` to the attack /
+> fine-tuning scripts below.
+
 #### Option 3: OpenVLA-OFT
 Install OpenVLA-OFT by following the installation instructions in its repository:  
 [OpenVLA-OFT Repository](https://github.com/moojink/openvla-oft)
@@ -56,14 +63,21 @@ python -m cp_openvla \
   --dataset_name <NAME OF THE DATASET> \
   --batch_size 4 \
   --perturbation_ratio 0.05 \
-  --alpha 0.8
+  --alpha 0.2
 ```
-For Pi0 and OpenVLA-OFT, use the corresponding scripts: `cp_pi0.py` and `cp_openvla_oft.py`, with the same arguments. If you want to conduct adversarial patch generation on **OpenVLA-OFT**, you need to manually comment out **line 12** and uncomment **line 13** in `VLAAttacker/pytorch/EDPA.py`. If you want to switch back to **OpenVLA**, you need to uncomment **line 12** and comment out **line 13**.
+For Pi0 and OpenVLA-OFT, use the corresponding scripts: `cp_pi0.py` and `cp_openvla_oft.py`, with the same arguments. `EDPA` now auto-dispatches on `cfg.model_family` internally, so no source-level edits are required to switch between OpenVLA / OpenVLA-OFT / Pi0.
 
-
+> ⚠️ `--alpha` now weights the **alignment** term (`(1 - alpha)` weights the
+> contrastive patch term). The default `0.2` reproduces our reported
+> patch-dominant setting. Callers that previously passed `--alpha 0.8` should
+> switch to `--alpha 0.2` for the same behavior.
 
 > ⚡ Note: If both the model and dataset support arm-mounted cameras, you can select which camera view to use with the `--camera_view` argument.  
 > Set it to `primary` to use the main camera or `wrist` to use the wrist-mounted camera.
+
+> ⚠️ For **Pi0**, `--vla_path` must point at the **PyTorch** checkpoint dir
+> (converted from JAX; see the Pi0 pre-requisite note above), not the JAX
+> orbax checkpoint shipped by upstream `openpi`.
 
 ### 2️⃣ Evaluating the VLA Performance on LIBERO Simulation Benchmark
 
@@ -94,22 +108,39 @@ python eval/simulation/Libero/pi0.py \
 
 ```
 
-### 3️⃣ Adversarial Fine-tuning on OpenVLA Visual Encoder
+### 3️⃣ Adversarial Fine-tuning of the Visual Encoder
 
 To perform adversarial fine-tuning on the OpenVLA visual encoder:
 
 ```bash
-torchrun --standalone --nnodes 1 --nproc-per-node 1 at_openvla.py \ 
+torchrun --standalone --nnodes 1 --nproc-per-node 1 at_openvla.py \
   --vla_path <PATH TO THE CHECKPOINT> \
   --data_root_dir <PATH TO BASE DATASETS DIR> \
   --dataset_name <NAME OF THE DATASET> \
-  --run_root_dir <PATH TO LOG/CHECKPOINT DIR \
+  --run_root_dir <PATH TO LOG/CHECKPOINT DIR> \
   --batch_size 16 \
   --grad_accumulation_steps 1 \
   --learning_rate 5e-4 \
   --image_aug True \
   --save_steps 10000 \
-  --max_steps 50000 \
+  --max_steps 50000
 ```
+
+For **OpenVLA-OFT** and **Pi0**, use the analogous scripts with the same
+arguments:
+
+```bash
+# OpenVLA-OFT
+torchrun --standalone --nnodes 1 --nproc-per-node 1 at_openvla_oft.py \
+  --vla_path <PATH TO THE OFT CHECKPOINT> \
+  ...
+
+# Pi0 (PyTorch checkpoint required)
+torchrun --standalone --nnodes 1 --nproc-per-node 1 at_pi0.py \
+  --vla_path <PATH TO THE PYTORCH pi0 CHECKPOINT> \
+  ...
+```
+
 > ⚡ Note: Compared to adversarial patch generation via EDPA, adversarial fine-tuning requires significantly more computational resources. We generally recommend running it on GPUs with at least A100 or equivalent.
-> Currently, adversarial fine-tuning scripts are only available for OpenVLA; Pi0 and OpenVLA-OFT are not yet supported.
+
+> ⚠️ **Pi0 adversarial fine-tuning (`at_pi0.py`) requires the PyTorch pi0 checkpoint** (converted from JAX; see the Pi0 pre-requisite note above). The JAX orbax checkpoint shipped by upstream `openpi` is not supported.

@@ -131,7 +131,7 @@ def get_avg_patch_text_attention(attn, patch_len, text_mask, layer=-1):
 class FinetuneConfig:
     # fmt: off
     vla_path: str = "openvla/openvla-7b-finetuned-libero-spatial"     # Path to OpenVLA model (on HuggingFace Hub)
-    # vla_path: str = "/media/haochuanxu/Working/githubRepo/model/openvla-7b-libero_spatial-wrist-img-encoder"     # Path to OpenVLA model (on HuggingFace Hub)
+    # vla_path: str = "<PATH TO CHECKPOINT>"     # Path to OpenVLA model (on HuggingFace Hub)
     # Directory Paths
     data_root_dir: Path = Path("dataset/modified_libero_rlds")        # Path to Open-X dataset directory
     dataset_name: str = "libero_spatial_no_noops"                     # Name of fine-tuning dataset (e.g., `droid_wipe`)
@@ -149,7 +149,7 @@ class FinetuneConfig:
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
-    wandb_entity: str = "hxu612"                                    # Name of entity to log under
+    wandb_entity: str = ""                                    # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
     # camera view for finetuning

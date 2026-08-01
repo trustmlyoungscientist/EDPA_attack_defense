@@ -35,26 +35,41 @@ def build_prompt(language_instructions, prompt_template="In: What action should 
     """
     return [prompt_template.format(instruction=instruction.lower()) for instruction in language_instructions]
 
-def image_transform(image, image_processor):
+def image_transform(images, processor):
 
-    if image_processor.tvf_do_letterbox:
-        image = image_processor.letterbox_pad_transform(image, image_processor.tvf_letterbox_fill)
+    image_processor = processor.image_processor
+    
+    if isinstance(images, torch.Tensor):
+        images = list(images)
+    if not isinstance(images, (list, tuple)):
+        images = [images]
+    
+    batch_imgs = []
 
-    imgs_t = []
-    for idx in range(len(image_processor.input_sizes)):
-        img_idx = TVF.resize(image, **image_processor.tvf_resize_params[idx])
-        img_idx = TVF.center_crop(img_idx, **image_processor.tvf_crop_params[idx])
-        # img_idx_t = TVF.to_tensor(img_idx)
-        img_idx_t = TVF.normalize(img_idx, **image_processor.tvf_normalize_params[idx])
-        imgs_t.append(img_idx_t)
+    for image in images:
+        
+        if image_processor.tvf_do_letterbox:
+            image = image_processor.letterbox_pad_transform(image, image_processor.tvf_letterbox_fill)
 
-    img_t = torch.vstack(imgs_t)
+        imgs_t = []
+        for idx in range(len(image_processor.input_sizes)):
+            img_idx = TVF.resize(image, **image_processor.tvf_resize_params[idx])
+            img_idx = TVF.center_crop(img_idx, **image_processor.tvf_crop_params[idx])
+            # img_idx_t = TVF.to_tensor(img_idx)
+            img_idx_t = TVF.normalize(img_idx, **image_processor.tvf_normalize_params[idx])
+            imgs_t.append(img_idx_t)
 
-    return img_t
+        # [V*C, H, W]
+        img_t = torch.vstack(imgs_t)
+        batch_imgs.append(img_t)
+
+    return torch.stack(batch_imgs)  # [B, V*C, H, W]
+    
 
 def get_img_embedding(vla, images):
-    return vla.projector(vla.vision_backbone(images.to(torch.bfloat16).to(vla.device)))
-        
+    patch_features = vla.vision_backbone(images.to(torch.bfloat16).to(vla.device))
+    return vla.projector(patch_features)
+
 
 def get_lang_embedding(vla, language_tokens):
     return vla.get_input_embeddings()(language_tokens.to(vla.device))
